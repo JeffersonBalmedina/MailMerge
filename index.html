@@ -536,6 +536,15 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
     <div class="modal-body">
       <div class="f-grp"><div class="f-lbl">Download As</div><div class="radio-row"><label class="r-opt"><input type="radio" name="dlas" value="zip" checked> ZIP (individual PDFs)</label><label class="r-opt"><input type="radio" name="dlas" value="merged"> Single merged PDF</label></div></div>
       <div class="f-grp"><div class="f-lbl">File Naming</div><input class="inp" id="naming" value="Document_{{row}}"><div style="font-size:10px;color:var(--muted);margin-top:2px">Use {{row}} or {{ColumnName}}</div></div>
+      <div class="f-grp">
+        <div class="f-lbl">Export Quality</div>
+        <select class="sel" id="exp-quality" style="width:100%">
+          <option value="3">🏆 High — 288 DPI (recommended)</option>
+          <option value="2">⚡ Standard — 192 DPI (smaller files)</option>
+          <option value="4">💎 Ultra — 384 DPI (largest files, best for print)</option>
+        </select>
+        <div style="font-size:10px;color:var(--muted);margin-top:2px">Higher = sharper images · text is always crisp vector</div>
+      </div>
       <div class="f-grp"><div class="f-lbl">Records</div>
         <div class="radio-row"><label class="r-opt"><input type="radio" name="rng" value="all" checked> All (<span id="tot-rows">0</span> rows)</label><label class="r-opt"><input type="radio" name="rng" value="range"> Range:</label></div>
         <div style="display:flex;align-items:center;gap:8px;margin-top:6px"><input type="number" class="inp" id="r-from" value="1" min="1" style="width:70px"><span style="color:var(--muted)">to</span><input type="number" class="inp" id="r-to" value="10" min="1" style="width:70px"></div>
@@ -590,7 +599,11 @@ const PAGES={
   executive:{w:7.25,h:10.5,unit:'in',lbl:'Executive 7.25×10.5"'},
   custom:{w:210,h:297,unit:'mm',lbl:'Custom'}
 };
+// Display DPI (canvas coordinate space — keep at 96 so existing coordinates stay stable)
 const DPI=96, PX_MM=DPI/25.4;
+// Export scale: offscreen canvas rendered at this multiple for high-res PDF embedding
+// 3× → 288 effective DPI (print-quality)
+const EXPORT_SCALE=3;
 let custUnit='mm';
 
 function docPx(){const p=PAGES[S.page];let w=p.unit==='in'?p.w*DPI:p.w*PX_MM,h=p.unit==='in'?p.h*DPI:p.h*PX_MM;if(S.orient==='landscape')[w,h]=[h,w];return{w:Math.round(w),h:Math.round(h)};}
@@ -1076,7 +1089,27 @@ function addTB(){
 }
 function addRect(){cv.add(new fabric.Rect({left:cx()-80,top:cy()-40,width:160,height:80,fill:'transparent',stroke:'#333',strokeWidth:1}));cv.renderAll();saveH();}
 function addHLine(){cv.add(new fabric.Line([0,0,200,0],{left:cx()-100,top:cy(),stroke:'#333',strokeWidth:1}));cv.renderAll();saveH();}
-function addImgEl(){const inp=document.createElement('input');inp.type='file';inp.accept='image/*';inp.onchange=()=>{const f=inp.files[0];if(!f)return;const r=new FileReader();r.onload=e=>{fabric.Image.fromURL(e.target.result,img=>{if(img.width>200)img.scaleToWidth(200);img.set({left:cx()-100,top:cy()-60});cv.add(img);cv.setActiveObject(img);cv.renderAll();saveH();notify('🖼','Image added');});};r.readAsDataURL(f);};inp.click();}
+function addImgEl(){
+  const inp=document.createElement('input');inp.type='file';inp.accept='image/*';
+  inp.onchange=()=>{
+    const f=inp.files[0];if(!f)return;
+    const r=new FileReader();
+    r.onload=e=>{
+      const dataUrl=e.target.result;
+      fabric.Image.fromURL(dataUrl,img=>{
+        // Scale to fit 200px wide on canvas but keep full-res src
+        if(img.width>200)img.scaleToWidth(200);
+        img.set({left:cx()-100,top:cy()-60,_srcHR:dataUrl});
+        // Attach high-res src for export
+        img.src=dataUrl;
+        cv.add(img);cv.setActiveObject(img);cv.renderAll();saveH();
+        notify('🖼','Image added');
+      });
+    };
+    r.readAsDataURL(f);
+  };
+  inp.click();
+}
 
 function delSel(){const o=cv.getActiveObject();if(!o)return;if(o._isBg){notify('⚠️','Unlock the background first (or use × to remove it)');return;}if(o.type==='activeSelection'){o.forEachObject(x=>cv.remove(x));cv.discardActiveObject();}else cv.remove(o);cv.renderAll();saveH();}
 function dupSel(){const o=cv.getActiveObject();if(!o||o._isBg)return;o.clone(c=>{c.set({left:o.left+18,top:o.top+18});if(o.templateText!==undefined)c.templateText=o.templateText;cv.add(c);cv.setActiveObject(c);cv.renderAll();saveH();});}
@@ -1405,6 +1438,9 @@ function closeModal(){
 
 async function startGen(){
   if(!S.rows.length){notify('❌','Load a CSV file first');return;}
+  // Apply chosen export quality
+  const qSel=document.getElementById('exp-quality');
+  if(qSel) window._EXPORT_SCALE=parseInt(qSel.value)||3;
   saveCurrentPageData();
   const hasContent=S.pageData.some(pd=>{
     if(!pd||!pd.canvasJson)return false;
@@ -1446,32 +1482,40 @@ async function genZip(s,e,naming,total){
     const row=S.rows[i],rd={};S.headers.forEach((h,j)=>rd[h]=row[j]||'');rd.row=(i+1).toString();
     const fn=(fillNaming(naming,rd)+'_row'+(i+1)+'.pdf').replace(/[<>:"/\\|?*]/g,'_').slice(0,100);
     const ori=S.orient==='landscape'?'landscape':'portrait';
-    const doc=new jsPDF({unit:'mm',format:[mm.w,mm.h],orientation:ori});
+    const doc=new jsPDF({unit:'mm',format:[mm.w,mm.h],orientation:ori,compress:true});
     for(let pg=0;pg<S.pageData.length;pg++){
       if(pg>0)doc.addPage([mm.w,mm.h],ori);
-      renderPageFromData(doc,S.pageData[pg],row,mm,px);
+      await renderPageFromData(doc,S.pageData[pg],row,mm,px);
     }
     zip.file(fn,doc.output('arraybuffer'));
-    if((i-s)%3===0)await sleep(0);
+    await sleep(0);
   }
   S.blob=await zip.generateAsync({type:'blob'});S.dlName='mailmerge-documents.zip';
 }
 
 async function genMerged(s,e,total){
   const{jsPDF}=window.jspdf,mm=docMm(),px=docPx(),ori=S.orient==='landscape'?'landscape':'portrait';
-  const doc=new jsPDF({unit:'mm',format:[mm.w,mm.h],orientation:ori});
+  const doc=new jsPDF({unit:'mm',format:[mm.w,mm.h],orientation:ori,compress:true});
   let first=true;
   for(let i=s;i<=e;i++){
     setProg((((i-s+1)/total)*100).toFixed(0),i-s+1,total);
     for(let pg=0;pg<S.pageData.length;pg++){
       if(!first)doc.addPage([mm.w,mm.h],ori);
       first=false;
-      renderPageFromData(doc,S.pageData[pg],S.rows[i],mm,px);
+      await renderPageFromData(doc,S.pageData[pg],S.rows[i],mm,px);
     }
-    if((i-s)%3===0)await sleep(0);
+    await sleep(0);
   }
   S.blob=doc.output('blob');S.dlName='merged-documents.pdf';
 }
+
+
+
+// ─── RENDER ENGINE ──────────────────────────────────────────────────────────
+// Two-step hybrid:
+//   Step 1 – offscreen Fabric canvas at EXPORT_SCALE× (high-res raster for bg/shapes/images)
+//   Step 2 – vector text drawn by jsPDF (always crisp, searchable)
+// ────────────────────────────────────────────────────────────────────────────
 
 const FONTMAP={
   'helvetica':'helvetica','arial':'helvetica','arial narrow':'helvetica',
@@ -1480,94 +1524,156 @@ const FONTMAP={
   'courier new':'courier','courier':'courier','monospace':'courier'
 };
 
-function renderPageFromData(doc,pd,row,mm,px){
-  if(!pd)return;
-  // sx/sy: converts canvas pixels (at 96dpi doc space) → PDF mm
-  const sx=mm.w/px.w, sy=mm.h/px.h;
-  if(pd.bgDataUrl){try{doc.addImage(pd.bgDataUrl,'PNG',0,0,mm.w,mm.h,undefined,'FAST');}catch(e){}}
-  if(!pd.canvasJson)return;
-  (pd.canvasJson.objects||[]).forEach(o=>{
-    if(o._isBg||o.visible===false)return;
-    // scaleX/scaleY: only non-1 for shapes; textboxes keep scale=1 (we convert scale→width on resize)
-    const scX=o.scaleX||1, scY=o.scaleY||1;
+// Render all non-text objects to a high-res offscreen canvas, return PNG data URL
+function renderBaseLayer(pd, px){
+  return new Promise(resolve=>{
+    if(!pd){resolve(null);return;}
+    const scale = (window._EXPORT_SCALE||3);
+    const W = Math.round(px.w * scale);
+    const H = Math.round(px.h * scale);
 
-    if(o.type==='textbox'||o.type==='i-text'){
-      // ── Merge field substitution ──
-      let txt=o.templateText||o.text||'';
-      S.headers.forEach((h,j)=>{ txt=txt.split('{{'+h+'}}').join(row[j]||''); });
-      if(!txt)return;
+    // Build a filtered JSON that contains only non-text, non-bg objects
+    const hasObjects = pd.canvasJson &&
+      (pd.canvasJson.objects||[]).some(o=>!o._isBg && o.visible!==false &&
+        !(o.type==='textbox'||o.type==='i-text'||o.type==='text'));
 
-      // ── Font ──
-      const fk=(o.fontFamily||'Helvetica').toLowerCase();
-      const jf=FONTMAP[fk]||'helvetica';
-      let fstyle='normal';
-      if(o.fontWeight==='bold'&&o.fontStyle==='italic') fstyle='bolditalic';
-      else if(o.fontWeight==='bold') fstyle='bold';
-      else if(o.fontStyle==='italic') fstyle='italic';
+    // If there's only a background and no shapes, skip Fabric entirely
+    if(!hasObjects){
+      if(!pd.bgDataUrl){resolve(null);return;}
+      const img = new Image();
+      img.onload = ()=>{
+        const el=document.createElement('canvas');
+        el.width=W; el.height=H;
+        const ctx=el.getContext('2d');
+        ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,W,H);
+        // Scale bg to cover full page
+        const iw=img.naturalWidth||W, ih=img.naturalHeight||H;
+        const s=Math.max(W/iw,H/ih);
+        ctx.drawImage(img,(W-iw*s)/2,(H-ih*s)/2,iw*s,ih*s);
+        resolve(el.toDataURL('image/png',1.0));
+      };
+      img.onerror = ()=>resolve(null);
+      img.src = pd.bgDataUrl;
+      return;
+    }
 
-      // fontSize in pt: CSS px * scaleY * (72pt/96px)
-      // scaleY is 1 for textboxes (we prevent scaling via object:scaling handler)
-      // but kept here for safety in case old saved data has scale
-      const fsPt=(o.fontSize||16)*scY*0.75;
-      doc.setFont(jf, fstyle);
-      doc.setFontSize(fsPt);
-      // Match Fabric's lineHeight (default 1.15 in jsPDF, override to match Fabric's value)
-      doc.setLineHeightFactor(o.lineHeight||1.15);
+    // Full offscreen Fabric canvas for shapes + bg together
+    const offEl = document.createElement('canvas');
+    offEl.width = W; offEl.height = H;
+    // Fabric.Canvas needs the element in a document — append hidden
+    offEl.style.cssText='position:fixed;left:-9999px;top:-9999px;visibility:hidden';
+    document.body.appendChild(offEl);
 
-      // ── Color ──
-      const col=rgbOf(o.fill||'#000000');
-      if(col) doc.setTextColor(col.r,col.g,col.b);
+    const offCv = new fabric.Canvas(offEl, {
+      width:W, height:H,
+      backgroundColor:'#ffffff',
+      enableRetinaScaling:false,
+      renderOnAddRemove:false
+    });
+    offCv.setZoom(scale);
 
-      // ── Background rect ──
-      const objW=(o.width||100)*scX;
-      const objH=(o.height||30)*scY;
-      const bg=o.backgroundColor;
-      if(bg&&bg!=='transparent'&&bg!==''){
-        const bc=rgbOf(bg);
-        if(bc){doc.setFillColor(bc.r,bc.g,bc.b);doc.rect(o.left*sx,o.top*sy,objW*sx,objH*sy,'F');}
-      }
+    // Build JSON with bg drawn as a rect/image, shapes kept, text removed
+    const jsonCopy = JSON.parse(JSON.stringify(pd.canvasJson||{objects:[]}));
+    jsonCopy.objects = (jsonCopy.objects||[]).filter(o=>{
+      if(o.visible===false) return false;
+      if(o.type==='textbox'||o.type==='i-text'||o.type==='text') return false;
+      if(o._isBg) return false; // draw bg separately below
+      return true;
+    });
 
-      // ── Text position ──
-      // Use baseline:'top' so Y maps directly to Fabric's object.top (no manual ascent offset needed)
-      const mxW=objW*sx;
-      const al=o.textAlign||'left';
-      let bx=o.left*sx;
-      const by=o.top*sy;   // baseline:'top' aligns top of text to this Y
-      if(al==='center') bx+=mxW/2;
-      else if(al==='right') bx+=mxW;
-      const lines=doc.splitTextToSize(txt, mxW);
-      doc.text(lines, bx, by, {align:al, baseline:'top'});
+    const finish = ()=>{
+      offCv.renderAll();
+      const dataUrl = offEl.toDataURL('image/png',1.0);
+      offCv.dispose();
+      document.body.removeChild(offEl);
+      resolve(dataUrl);
+    };
 
-    }else if(o.type==='rect'){
-      const x=o.left*sx, y=o.top*sy;
-      const w=(o.width||0)*scX*sx, h=(o.height||0)*scY*sy;
-      const fc=rgbOf(o.fill&&o.fill!=='transparent'?o.fill:null);
-      const sc2=rgbOf(o.stroke||null);
-      let mode='S';
-      if(fc){doc.setFillColor(fc.r,fc.g,fc.b); mode=sc2?'FD':'F';}
-      if(sc2){doc.setDrawColor(sc2.r,sc2.g,sc2.b); doc.setLineWidth((o.strokeWidth||1)*sx*0.5);}
-      doc.rect(x,y,w,h,mode);
+    const loadShapes = ()=>{
+      if(!jsonCopy.objects.length){finish();return;}
+      offCv.loadFromJSON(jsonCopy, finish);
+    };
 
-    }else if(o.type==='line'){
-      const sc2=rgbOf(o.stroke||'#000000');
-      if(sc2){doc.setDrawColor(sc2.r,sc2.g,sc2.b); doc.setLineWidth((o.strokeWidth||1)*sx*0.5);}
-      const x1=o.left*sx, y1=o.top*sy;
-      const x2=(o.left+(o.width||0)*scX)*sx, y2=y1;
-      doc.line(x1,y1,x2,y2);
-
-    }else if(o.type==='image'){
-      // Embedded images (non-background)
-      try{
-        const x=o.left*sx, y=o.top*sy;
-        const w=(o.width||100)*scX*sx, h=(o.height||100)*scY*sy;
-        if(o.src) doc.addImage(o.src,'PNG',x,y,w,h,undefined,'FAST');
-      }catch(e){}
+    // Draw background image first using native canvas 2D, then load shapes on top
+    if(pd.bgDataUrl){
+      const bgImg = new Image();
+      bgImg.onload = ()=>{
+        const iw=bgImg.naturalWidth||W, ih=bgImg.naturalHeight||H;
+        const s=Math.max(W/iw,H/ih);
+        const ctx = offEl.getContext('2d');
+        ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,W,H);
+        ctx.drawImage(bgImg,(W-iw*s)/2,(H-ih*s)/2,iw*s,ih*s);
+        // Now let Fabric render shapes on top (it clears canvas by default — prevent that)
+        offCv.set({backgroundColor:null});
+        loadShapes();
+      };
+      bgImg.onerror = loadShapes;
+      bgImg.src = pd.bgDataUrl;
+    }else{
+      loadShapes();
     }
   });
 }
 
-function triggerDL(){
-  if(!S.blob){notify('❌','No document ready — generate first');return;}
+async function renderPageFromData(doc, pd, row, mm, px){
+  if(!pd) return;
+  const sx = mm.w/px.w, sy = mm.h/px.h;
+
+  // ── Step 1: high-res raster base ──
+  try{
+    const baseImg = await renderBaseLayer(pd, px);
+    if(baseImg){
+      doc.addImage(baseImg,'PNG',0,0,mm.w,mm.h,undefined,'FAST');
+    }
+  }catch(e){ console.warn('Base layer failed:',e); }
+
+  if(!pd.canvasJson) return;
+
+  // ── Step 2: vector text ──
+  (pd.canvasJson.objects||[]).forEach(o=>{
+    if(o._isBg||o.visible===false) return;
+    if(!(o.type==='textbox'||o.type==='i-text'||o.type==='text')) return;
+
+    const scX=o.scaleX||1, scY=o.scaleY||1;
+    let txt = o.templateText||o.text||'';
+    S.headers.forEach((h,j)=>{ txt=txt.split('{{'+h+'}}').join(row[j]||''); });
+    if(!txt) return;
+
+    const fk = (o.fontFamily||'Helvetica').toLowerCase();
+    const jf = FONTMAP[fk]||'helvetica';
+    let fstyle='normal';
+    if(o.fontWeight==='bold'&&o.fontStyle==='italic') fstyle='bolditalic';
+    else if(o.fontWeight==='bold')  fstyle='bold';
+    else if(o.fontStyle==='italic') fstyle='italic';
+
+    const fsPt = (o.fontSize||16)*scY*0.75;
+    doc.setFont(jf,fstyle);
+    doc.setFontSize(fsPt);
+    doc.setLineHeightFactor(o.lineHeight||1.15);
+
+    const col=rgbOf(o.fill||'#000000');
+    if(col) doc.setTextColor(col.r,col.g,col.b);
+
+    const objW=(o.width||100)*scX;
+    const bg=o.backgroundColor;
+    if(bg&&bg!=='transparent'&&bg!==''){
+      const bc=rgbOf(bg);
+      if(bc){
+        doc.setFillColor(bc.r,bc.g,bc.b);
+        doc.rect(o.left*sx,o.top*sy,objW*sx,(o.height||20)*scY*sy,'F');
+      }
+    }
+
+    const mxW=objW*sx, al=o.textAlign||'left';
+    let bx=o.left*sx;
+    if(al==='center') bx+=mxW/2;
+    else if(al==='right') bx+=mxW;
+
+    doc.text(doc.splitTextToSize(txt,mxW), bx, o.top*sy, {align:al,baseline:'top'});
+  });
+}
+
+function triggerDL(){  if(!S.blob){notify('❌','No document ready — generate first');return;}
   closeModal();dlBlob(S.blob,S.dlName);
 }
 
