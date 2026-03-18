@@ -232,6 +232,8 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--f
   <div class="logo"><div class="logo-mark">✉</div><span>MailMerge <strong>Pro</strong></span></div>
   <div class="spacer"></div>
   <button class="btn btn-ghost btn-sm" id="btn-preview" onclick="togglePreview()">👁 Preview</button>
+  <button class="btn btn-ghost btn-sm" onclick="document.getElementById('tpl-load-inp').click()">📂 Load</button>
+  <input type="file" id="tpl-load-inp" accept=".json" style="display:none" onchange="loadTemplate(this.files[0]);this.value=''">
   <button class="btn btn-ghost btn-sm" onclick="saveTemplate()">💾 Save</button>
   <button class="btn btn-green btn-sm" onclick="openModal()">⚡ Generate</button>
 </header>
@@ -626,7 +628,16 @@ function initCanvas(){
   cv.on('object:modified',()=>{saveH();updLayers();syncPropsFromSel();queueThumbForPage(S.curPage);});
   cv.on('object:added',e=>{
     const o=e.target;
-    if(isTB(o)&&!o._hh){o._hh=true;o.on('changed',function(){if(!S.preview)this.templateText=this.text;});}
+    if(isTB(o)&&!o._hh){
+      o._hh=true;
+      // Set templateText from text if not already defined
+      if(o.templateText===undefined||o.templateText===null) o.templateText=o.text||'';
+      o.on('changed',function(){
+        // Only update templateText when NOT in preview mode
+        // (Preview mode substitutes {{fields}} into .text — we never want to overwrite templateText with that)
+        if(!S.preview) this.templateText=this.text;
+      });
+    }
     updLayers();updSt();queueThumbForPage(S.curPage);
   });
   cv.on('object:removed',()=>{updLayers();updSt();queueThumbForPage(S.curPage);});
@@ -674,13 +685,29 @@ function syncWrap(d,z){const w=document.getElementById('canvas-wrap');w.style.wi
 //  MULTI-PAGE MANAGEMENT
 // ════════════════════════════════════════════════════════════
 function saveCurrentPageData(){
-  if(!cv)return;
-  const json=JSON.parse(JSON.stringify(cv.toJSON(['templateText','_hh','_isBg'])));
-  if(!S.pageData[S.curPage])S.pageData[S.curPage]=emptyPageData();
-  S.pageData[S.curPage].canvasJson=json;
-  S.pageData[S.curPage].bgDataUrl=S.bgDataUrl;
-  S.pageData[S.curPage].bgMode=S.bgMode;
-  S.pageData[S.curPage].bgLocked=S.bgLocked;
+  if(!cv) return;
+  // Always snapshot the TEMPLATE state (with {{placeholders}}), not preview state
+  const wasPreview = S.preview;
+  if(wasPreview) restoreTpl();   // temporarily put {{fields}} back into .text
+
+  // Capture JSON — templateText is saved as a custom property
+  const json = JSON.parse(JSON.stringify(cv.toJSON(['templateText','_hh','_isBg'])));
+
+  // Belt-and-braces: make sure .text == templateText for every textbox in the JSON
+  // so that when we load this JSON for rendering, the right content is there
+  (json.objects||[]).forEach(o=>{
+    if((o.type==='textbox'||o.type==='i-text'||o.type==='text') && o.templateText!=null){
+      o.text = o.templateText;
+    }
+  });
+
+  if(wasPreview && S.rows.length) applyPrev(0); // restore preview display
+
+  if(!S.pageData[S.curPage]) S.pageData[S.curPage] = emptyPageData();
+  S.pageData[S.curPage].canvasJson  = json;
+  S.pageData[S.curPage].bgDataUrl   = S.bgDataUrl;
+  S.pageData[S.curPage].bgMode      = S.bgMode;
+  S.pageData[S.curPage].bgLocked    = S.bgLocked;
 }
 function loadPageData(idx){
   if(!cv||idx<0||idx>=S.pageData.length)return;
@@ -1413,13 +1440,129 @@ function saveH(){
   if(hist.length>30)hist.shift();
   hIdx=hist.length-1;
 }
-function undo(){if(hIdx<=0)return;hIdx--;isUndo=true;cv.loadFromJSON(hist[hIdx],()=>{cv.renderAll();isUndo=false;S.bgObj=cv.getObjects().find(o=>o._isBg)||null;if(S.bgObj)setObjLocked(S.bgObj,S.bgLocked);updLayers();});}
-function redo(){if(hIdx>=hist.length-1)return;hIdx++;isUndo=true;cv.loadFromJSON(hist[hIdx],()=>{cv.renderAll();isUndo=false;S.bgObj=cv.getObjects().find(o=>o._isBg)||null;if(S.bgObj)setObjLocked(S.bgObj,S.bgLocked);updLayers();});}
+function undo(){
+  if(hIdx<=0)return;hIdx--;isUndo=true;
+  cv.loadFromJSON(hist[hIdx],()=>{
+    cv.renderAll();isUndo=false;
+    S.bgObj=cv.getObjects().find(o=>o._isBg)||null;
+    if(S.bgObj)setObjLocked(S.bgObj,S.bgLocked);
+    reAttachTemplateListeners();
+    updLayers();
+  });
+}
+function redo(){
+  if(hIdx>=hist.length-1)return;hIdx++;isUndo=true;
+  cv.loadFromJSON(hist[hIdx],()=>{
+    cv.renderAll();isUndo=false;
+    S.bgObj=cv.getObjects().find(o=>o._isBg)||null;
+    if(S.bgObj)setObjLocked(S.bgObj,S.bgLocked);
+    reAttachTemplateListeners();
+    updLayers();
+  });
+}
+
+// Re-attach templateText changed listeners after any loadFromJSON call
+function reAttachTemplateListeners(){
+  cv.getObjects().forEach(o=>{
+    if(!isTB(o)||o._hh) return;
+    o._hh=true;
+    if(o.templateText===undefined||o.templateText===null) o.templateText=o.text||'';
+    o.on('changed',function(){ if(!S.preview) this.templateText=this.text; });
+  });
+}
 
 // ════════════════════════════════════════════════════════════
 //  TEMPLATE SAVE
 // ════════════════════════════════════════════════════════════
-function saveTemplate(){saveCurrentPageData();const tpl={v:2,pageData:S.pageData,page:S.page,orient:S.orient,canvas:cv.toJSON(['templateText','_isBg'])};dlBlob(new Blob([JSON.stringify(tpl,null,2)],{type:'application/json'}),'mailmerge-template.json');notify('💾','Template saved!');}
+function saveTemplate(){
+  saveCurrentPageData();
+  const tpl={
+    v:3,
+    page:S.page, orient:S.orient,
+    pageData:S.pageData.map(pd=>({
+      canvasJson:pd.canvasJson,
+      bgDataUrl:pd.bgDataUrl||null,
+      bgMode:pd.bgMode||'fit',
+      bgLocked:pd.bgLocked!==false
+    }))
+  };
+  dlBlob(new Blob([JSON.stringify(tpl,null,2)],{type:'application/json'}),'mailmerge-template.json');
+  notify('💾','Template saved!');
+}
+
+function loadTemplate(file){
+  if(!file) return;
+  const reader=new FileReader();
+  reader.onload=e=>{
+    try{
+      const tpl=JSON.parse(e.target.result);
+      // Restore page settings
+      if(tpl.page){
+        S.page=tpl.page;
+        const sel=document.getElementById('pg-size');
+        if(sel) sel.value=tpl.page;
+      }
+      if(tpl.orient){
+        S.orient=tpl.orient;
+        document.getElementById('or-p').classList.toggle('on',tpl.orient==='portrait');
+        document.getElementById('or-l').classList.toggle('on',tpl.orient==='landscape');
+      }
+      // Restore page data
+      let pages=[];
+      if(tpl.pageData&&Array.isArray(tpl.pageData)){
+        pages=tpl.pageData.map(pd=>({
+          canvasJson:pd.canvasJson||null,
+          bgDataUrl:pd.bgDataUrl||null,
+          bgMode:pd.bgMode||'fit',
+          bgLocked:pd.bgLocked!==false,
+          thumb:null
+        }));
+      }else if(tpl.canvas){
+        // Legacy v1/v2 format – single page
+        pages=[{canvasJson:tpl.canvas,bgDataUrl:null,bgMode:'fit',bgLocked:true,thumb:null}];
+      }
+      if(!pages.length){notify('❌','No page data found in template');return;}
+      S.pageData=pages;
+      S.curPage=0;
+      // Load first page onto canvas
+      const pd=S.pageData[0];
+      S.bgDataUrl=pd.bgDataUrl||null;
+      S.bgMode=pd.bgMode||'fit';
+      S.bgLocked=pd.bgLocked!==false;
+      const afterLoad=()=>{
+        // Re-attach templateText listener for all textboxes
+        cv.getObjects().forEach(o=>{
+          if(isTB(o)&&!o._hh){
+            o._hh=true;
+            // Ensure templateText is set from text if missing
+            if(o.templateText===undefined) o.templateText=o.text||'';
+            o.on('changed',function(){if(!S.preview)this.templateText=this.text;});
+          }
+        });
+        cv.renderAll();
+        S.bgObj=cv.getObjects().find(o=>o._isBg)||null;
+        if(S.bgObj) setObjLocked(S.bgObj,S.bgLocked);
+        if(S.bgDataUrl&&!S.bgObj) applyBgToCanvas(S.bgDataUrl,1,S.bgMode,S.bgLocked);
+        updBgUI(); updLayers(); updSt(); updPgStrip(); updPgNav();
+        rebuildCanvas();
+        // Queue thumbnails for all pages
+        S.pageData.forEach((_,i)=>queueThumbForPage(i));
+        notify('📂','Template loaded: '+pages.length+' page'+(pages.length>1?'s':'')+' · '+file.name);
+      };
+      if(pd.canvasJson){
+        cv.loadFromJSON(pd.canvasJson, afterLoad);
+      }else{
+        cv.clear();
+        cv.setBackgroundColor('#ffffff',afterLoad);
+      }
+      saveH();
+    }catch(err){
+      notify('❌','Load failed: '+err.message);
+      console.error(err);
+    }
+  };
+  reader.readAsText(file);
+}
 
 // ════════════════════════════════════════════════════════════
 //  GENERATE / EXPORT
@@ -1512,9 +1655,15 @@ async function genMerged(s,e,total){
 
 
 // ─── RENDER ENGINE ──────────────────────────────────────────────────────────
-// Two-step hybrid:
-//   Step 1 – offscreen Fabric canvas at EXPORT_SCALE× (high-res raster for bg/shapes/images)
-//   Step 2 – vector text drawn by jsPDF (always crisp, searchable)
+// Approach: render every page entirely through Fabric's own engine at high DPI.
+// This guarantees the exported PDF is pixel-for-pixel identical to the preview
+// — no coordinate translation, no jsPDF font metric guessing.
+//
+// Flow per page:
+//   1. Load canvasJson into a hidden offscreen Fabric canvas at EXPORT_SCALE×
+//   2. Substitute {{merge fields}} in all textbox objects on the live canvas
+//   3. renderAll() → capture PNG at full quality
+//   4. Embed PNG in jsPDF covering the full page
 // ────────────────────────────────────────────────────────────────────────────
 
 const FONTMAP={
@@ -1524,153 +1673,100 @@ const FONTMAP={
   'courier new':'courier','courier':'courier','monospace':'courier'
 };
 
-// Render all non-text objects to a high-res offscreen canvas, return PNG data URL
-function renderBaseLayer(pd, px){
-  return new Promise(resolve=>{
-    if(!pd){resolve(null);return;}
-    const scale = (window._EXPORT_SCALE||3);
+// Render one page to a PNG data URL at high resolution
+function renderPageToPng(pd, row, px){
+  return new Promise((resolve, reject)=>{
+    if(!pd || !pd.canvasJson){ resolve(null); return; }
+
+    const scale = window._EXPORT_SCALE || 3;
     const W = Math.round(px.w * scale);
     const H = Math.round(px.h * scale);
 
-    // Build a filtered JSON that contains only non-text, non-bg objects
-    const hasObjects = pd.canvasJson &&
-      (pd.canvasJson.objects||[]).some(o=>!o._isBg && o.visible!==false &&
-        !(o.type==='textbox'||o.type==='i-text'||o.type==='text'));
-
-    // If there's only a background and no shapes, skip Fabric entirely
-    if(!hasObjects){
-      if(!pd.bgDataUrl){resolve(null);return;}
-      const img = new Image();
-      img.onload = ()=>{
-        const el=document.createElement('canvas');
-        el.width=W; el.height=H;
-        const ctx=el.getContext('2d');
-        ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,W,H);
-        // Scale bg to cover full page
-        const iw=img.naturalWidth||W, ih=img.naturalHeight||H;
-        const s=Math.max(W/iw,H/ih);
-        ctx.drawImage(img,(W-iw*s)/2,(H-ih*s)/2,iw*s,ih*s);
-        resolve(el.toDataURL('image/png',1.0));
-      };
-      img.onerror = ()=>resolve(null);
-      img.src = pd.bgDataUrl;
-      return;
-    }
-
-    // Full offscreen Fabric canvas for shapes + bg together
+    // Create a real DOM canvas (Fabric 5 requires it)
     const offEl = document.createElement('canvas');
-    offEl.width = W; offEl.height = H;
-    // Fabric.Canvas needs the element in a document — append hidden
-    offEl.style.cssText='position:fixed;left:-9999px;top:-9999px;visibility:hidden';
+    offEl.width  = W;
+    offEl.height = H;
+    offEl.style.cssText = 'position:fixed;left:-99999px;top:-99999px;';
     document.body.appendChild(offEl);
 
     const offCv = new fabric.Canvas(offEl, {
-      width:W, height:H,
-      backgroundColor:'#ffffff',
-      enableRetinaScaling:false,
-      renderOnAddRemove:false
+      width: W, height: H,
+      backgroundColor: '#ffffff',
+      enableRetinaScaling: false,
+      renderOnAddRemove: false
     });
     offCv.setZoom(scale);
 
-    // Build JSON with bg drawn as a rect/image, shapes kept, text removed
-    const jsonCopy = JSON.parse(JSON.stringify(pd.canvasJson||{objects:[]}));
-    jsonCopy.objects = (jsonCopy.objects||[]).filter(o=>{
-      if(o.visible===false) return false;
-      if(o.type==='textbox'||o.type==='i-text'||o.type==='text') return false;
-      if(o._isBg) return false; // draw bg separately below
-      return true;
-    });
+    // Load the page JSON
+    const jsonClone = JSON.parse(JSON.stringify(pd.canvasJson));
 
-    const finish = ()=>{
-      offCv.renderAll();
-      const dataUrl = offEl.toDataURL('image/png',1.0);
-      offCv.dispose();
-      document.body.removeChild(offEl);
-      resolve(dataUrl);
-    };
+    offCv.loadFromJSON(jsonClone, ()=>{
+      // ── Apply background image if stored separately ──
+      // (bg may be in bgDataUrl or already in canvasJson as a _isBg object)
+      const hasBgObj = offCv.getObjects().some(o => o._isBg);
 
-    const loadShapes = ()=>{
-      if(!jsonCopy.objects.length){finish();return;}
-      offCv.loadFromJSON(jsonCopy, finish);
-    };
+      const applyBgAndRender = ()=>{
+        // ── Substitute merge fields in every textbox ──
+        offCv.getObjects().forEach(o=>{
+          if(!(o.type==='textbox'||o.type==='i-text'||o.type==='text')) return;
+          // Use templateText as the canonical source (never the display text)
+          const tmpl = (o.templateText !== undefined && o.templateText !== null)
+                         ? o.templateText : (o.text||'');
+          let txt = tmpl;
+          if(row && S.headers && S.headers.length){
+            S.headers.forEach((h,j)=>{
+              txt = txt.split('{{'+h+'}}').join((row[j]!=null?row[j]:'')); 
+            });
+          }
+          o.set('text', txt);
+          // Keep templateText intact — only display text changes
+        });
 
-    // Draw background image first using native canvas 2D, then load shapes on top
-    if(pd.bgDataUrl){
-      const bgImg = new Image();
-      bgImg.onload = ()=>{
-        const iw=bgImg.naturalWidth||W, ih=bgImg.naturalHeight||H;
-        const s=Math.max(W/iw,H/ih);
-        const ctx = offEl.getContext('2d');
-        ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,W,H);
-        ctx.drawImage(bgImg,(W-iw*s)/2,(H-ih*s)/2,iw*s,ih*s);
-        // Now let Fabric render shapes on top (it clears canvas by default — prevent that)
-        offCv.set({backgroundColor:null});
-        loadShapes();
+        offCv.renderAll();
+
+        // Export at full quality
+        const dataUrl = offEl.toDataURL('image/jpeg', 0.95);   // JPEG ~30% smaller than PNG, still sharp
+        offCv.dispose();
+        try{ document.body.removeChild(offEl); }catch(e){}
+        resolve(dataUrl);
       };
-      bgImg.onerror = loadShapes;
-      bgImg.src = pd.bgDataUrl;
-    }else{
-      loadShapes();
-    }
+
+      if(!hasBgObj && pd.bgDataUrl){
+        // Background stored separately — load as fabric.Image and send to back
+        fabric.Image.fromURL(pd.bgDataUrl, bgImg=>{
+          if(bgImg){
+            const cw = px.w, ch = px.h;
+            const s  = Math.max(cw/bgImg.width, ch/bgImg.height);
+            bgImg.set({
+              scaleX: s, scaleY: s,
+              left: (cw - bgImg.width*s)/2,
+              top:  (ch - bgImg.height*s)/2,
+              originX:'left', originY:'top',
+              selectable:false, evented:false, _isBg:true
+            });
+            offCv.add(bgImg);
+            offCv.sendToBack(bgImg);
+          }
+          applyBgAndRender();
+        }, { crossOrigin:'anonymous' });
+      } else {
+        applyBgAndRender();
+      }
+    });
   });
 }
 
 async function renderPageFromData(doc, pd, row, mm, px){
   if(!pd) return;
-  const sx = mm.w/px.w, sy = mm.h/px.h;
-
-  // ── Step 1: high-res raster base ──
   try{
-    const baseImg = await renderBaseLayer(pd, px);
-    if(baseImg){
-      doc.addImage(baseImg,'PNG',0,0,mm.w,mm.h,undefined,'FAST');
+    const img = await renderPageToPng(pd, row, px);
+    if(img){
+      // Fill page exactly — WYSIWYG
+      doc.addImage(img, 'JPEG', 0, 0, mm.w, mm.h, undefined, 'FAST');
     }
-  }catch(e){ console.warn('Base layer failed:',e); }
-
-  if(!pd.canvasJson) return;
-
-  // ── Step 2: vector text ──
-  (pd.canvasJson.objects||[]).forEach(o=>{
-    if(o._isBg||o.visible===false) return;
-    if(!(o.type==='textbox'||o.type==='i-text'||o.type==='text')) return;
-
-    const scX=o.scaleX||1, scY=o.scaleY||1;
-    let txt = o.templateText||o.text||'';
-    S.headers.forEach((h,j)=>{ txt=txt.split('{{'+h+'}}').join(row[j]||''); });
-    if(!txt) return;
-
-    const fk = (o.fontFamily||'Helvetica').toLowerCase();
-    const jf = FONTMAP[fk]||'helvetica';
-    let fstyle='normal';
-    if(o.fontWeight==='bold'&&o.fontStyle==='italic') fstyle='bolditalic';
-    else if(o.fontWeight==='bold')  fstyle='bold';
-    else if(o.fontStyle==='italic') fstyle='italic';
-
-    const fsPt = (o.fontSize||16)*scY*0.75;
-    doc.setFont(jf,fstyle);
-    doc.setFontSize(fsPt);
-    doc.setLineHeightFactor(o.lineHeight||1.15);
-
-    const col=rgbOf(o.fill||'#000000');
-    if(col) doc.setTextColor(col.r,col.g,col.b);
-
-    const objW=(o.width||100)*scX;
-    const bg=o.backgroundColor;
-    if(bg&&bg!=='transparent'&&bg!==''){
-      const bc=rgbOf(bg);
-      if(bc){
-        doc.setFillColor(bc.r,bc.g,bc.b);
-        doc.rect(o.left*sx,o.top*sy,objW*sx,(o.height||20)*scY*sy,'F');
-      }
-    }
-
-    const mxW=objW*sx, al=o.textAlign||'left';
-    let bx=o.left*sx;
-    if(al==='center') bx+=mxW/2;
-    else if(al==='right') bx+=mxW;
-
-    doc.text(doc.splitTextToSize(txt,mxW), bx, o.top*sy, {align:al,baseline:'top'});
-  });
+  }catch(e){
+    console.error('Render error:', e);
+  }
 }
 
 function triggerDL(){  if(!S.blob){notify('❌','No document ready — generate first');return;}
